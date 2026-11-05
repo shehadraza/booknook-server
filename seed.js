@@ -112,74 +112,71 @@ function splitTitle(title, maxLength = 17) {
   return lines.slice(0, 4);
 }
 
-function createCover(book, index) {
-  const [primary, dark, accent] = palettes[index % palettes.length];
-  const lines = splitTitle(book.title);
-  const fontSize = lines.length >= 4 ? 39 : lines.length === 3 ? 45 : 52;
-  const lineHeight = 62;
-  const firstY = 365 - ((lines.length - 1) * lineHeight) / 2;
 
-  const titleSvg = lines.map((line, i) => `
-    <text x="400" y="${firstY + i * lineHeight}"
-      text-anchor="middle"
-      font-family="Georgia,serif"
-      font-size="${fontSize}"
-      font-weight="700"
-      fill="#fffaf0">${escapeXml(line)}</text>
-  `).join("");
+function normalize(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
-  const svg = `
-  <svg xmlns="http://www.w3.org/2000/svg" width="800" height="1100" viewBox="0 0 800 1100">
-    <defs>
-      <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="${primary}"/>
-        <stop offset="100%" stop-color="${dark}"/>
-      </linearGradient>
-      <radialGradient id="glow">
-        <stop offset="0%" stop-color="${accent}" stop-opacity=".28"/>
-        <stop offset="100%" stop-color="${accent}" stop-opacity="0"/>
-      </radialGradient>
-    </defs>
+async function findRealCover(book) {
+  const params = new URLSearchParams({
+    title: book.title,
+    author: book.author,
+    fields: "title,author_name,cover_i",
+    limit: "10",
+  });
 
-    <rect width="800" height="1100" fill="url(#background)"/>
-    <circle cx="650" cy="180" r="300" fill="url(#glow)"/>
-    <circle cx="120" cy="900" r="250" fill="url(#glow)"/>
+  const response = await fetch(
+    `https://openlibrary.org/search.json?${params}`,
+    {
+      headers: {
+        "User-Agent": "BookNookSeed/1.0 (library@booknook.com)",
+      },
+    }
+  );
 
-    <rect x="42" y="42" width="716" height="1016" rx="8"
-      fill="none" stroke="${accent}" stroke-width="3"/>
-    <rect x="62" y="62" width="676" height="976" rx="5"
-      fill="none" stroke="#fffaf0" stroke-width="1.5" opacity=".25"/>
+  if (!response.ok) {
+    throw new Error(`Open Library search failed: ${response.status}`);
+  }
 
-    <path d="M110 170 H690" stroke="${accent}" stroke-width="3"/>
-    <text x="400" y="135" text-anchor="middle" fill="${accent}"
-      font-family="Arial,sans-serif" font-size="23"
-      letter-spacing="8" font-weight="700">BOOKNOOK LIBRARY</text>
+  const data = await response.json();
 
-    <g opacity=".14" fill="none" stroke="#fffaf0" stroke-width="3">
-      <circle cx="400" cy="520" r="250"/>
-      <circle cx="400" cy="520" r="220"/>
-      <path d="M400 270 V770 M150 520 H650"/>
-    </g>
+  const expectedTitle = normalize(book.title);
+  const expectedAuthor = normalize(book.author);
+  const authorSurname = expectedAuthor.split(" ").pop();
 
-    ${titleSvg}
+  const match = (data.docs || []).find((item) => {
+    const titleMatches = normalize(item.title) === expectedTitle;
 
-    <path d="M285 735 H515" stroke="${accent}" stroke-width="5"/>
-    <text x="400" y="805" text-anchor="middle" fill="${accent}"
-      font-family="Arial,sans-serif" font-size="22"
-      letter-spacing="6" font-weight="700">${escapeXml(book.category.toUpperCase())}</text>
+    const authorMatches = (item.author_name || []).some((name) => {
+      const normalizedAuthor = normalize(name);
 
-    <text x="400" y="920" text-anchor="middle" fill="#fffaf0"
-      font-family="Georgia,serif" font-size="30">${escapeXml(book.author)}</text>
+      return (
+        normalizedAuthor === expectedAuthor ||
+        normalizedAuthor.includes(authorSurname)
+      );
+    });
 
-    <text x="400" y="990" text-anchor="middle" fill="#fffaf0"
-      opacity=".55" font-family="Arial,sans-serif"
-      font-size="15" letter-spacing="5">A BOOKNOOK EDITION</text>
-  </svg>`;
+    return titleMatches && authorMatches && item.cover_i;
+  });
 
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+  if (!match) return null;
+
+  return `https://covers.openlibrary.org/b/id/${match.cover_i}-L.jpg`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const client = new MongoClient(process.env.MONGODB_URI);
+
+
+
 
 async function seed() {
   if (!process.env.MONGODB_URI) {
@@ -191,33 +188,61 @@ async function seed() {
 
     const collection = client.db("booknook").collection("books");
 
-    // Only replace records belonging to the BookNook sample library.
-    // Real users' books and borrow records are not deleted.
-    const removed = await collection.deleteMany({
-      ownerId: OWNER.ownerId,
-    });
+    console.log("Starting real book cover update...");
 
-    const now = Date.now();
+    let updated = 0;
+    let notFound = 0;
+    let failed = 0;
 
-    const documents = books.map((book, index) => ({
-      ...book,
-      image: createCover(book, index),
-      availableCopies: book.totalCopies,
-      ...OWNER,
-      createdAt: new Date(now - index * 60 * 1000),
-      updatedAt: new Date(now - index * 60 * 1000),
-    }));
+    for (const book of books) {
+      try {
+        const image = await findRealCover(book);
 
-    const result = await collection.insertMany(documents);
+        if (!image) {
+          console.log(`NOT FOUND: ${book.title}`);
+          notFound++;
+          await delay(1100);
+          continue;
+        }
 
-    console.log("--------------------------------------");
-    console.log("BookNook library seeding completed.");
-    console.log(`Removed old library sample books: ${removed.deletedCount}`);
-    console.log(`Added new library books: ${result.insertedCount}`);
-    console.log(`Total seed books: ${books.length}`);
-    console.log("--------------------------------------");
+        const result = await collection.updateOne(
+          {
+            ownerId: OWNER.ownerId,
+            title: book.title,
+            author: book.author,
+          },
+          {
+            $set: {
+              image,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (result.matchedCount > 0) {
+          console.log(`UPDATED: ${book.title}`);
+          updated++;
+        } else {
+          console.log(`BOOK NOT FOUND IN DATABASE: ${book.title}`);
+          notFound++;
+        }
+      } catch (error) {
+        console.error(`FAILED: ${book.title}`, error.message);
+        failed++;
+      }
+
+      // Respect Open Library's API rate limits.
+      await delay(1100);
+    }
+
+    console.log("\n================================");
+    console.log("BOOKNOOK COVER UPDATE COMPLETED");
+    console.log(`Updated: ${updated}`);
+    console.log(`Not found: ${notFound}`);
+    console.log(`Failed: ${failed}`);
+    console.log("================================");
   } catch (error) {
-    console.error("Seed failed:", error);
+    console.error("Cover update failed:", error);
     process.exitCode = 1;
   } finally {
     await client.close();
@@ -225,3 +250,6 @@ async function seed() {
 }
 
 seed();
+
+
+
